@@ -1,9 +1,9 @@
-import asyncio
 import logging
 import os
 import re
 import shutil
 import tempfile
+import hashlib
 from pathlib import Path
 
 from telegram import BotCommand, Update
@@ -35,40 +35,27 @@ FOLDER_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff\u3400-\u4dbf-]+$")
 # chat_id -> current folder name
 chat_folders: dict[int, str] = {}
 
-# group_key -> list of saved filenames
-pending_groups: dict[str, list[str]] = {}
-# group_key -> asyncio.Task for delayed flush
-group_tasks: dict[str, asyncio.Task] = {}
-
-
-async def _flush_group(
-    group_key: str, chat_id: int, reply_to_message_id: int, bot, folder: str
-) -> None:
-    await asyncio.sleep(2)
-    saved_names = pending_groups.pop(group_key, [])
-    group_tasks.pop(group_key, None)
-    if not saved_names:
-        return
-    count = len(saved_names)
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"Saved {count} file(s) to {folder}/",
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
-def _get_dest_dir(chat_id: int) -> Path:
-    folder = chat_folders.get(chat_id, "default")
+def _get_dest_dir(folder: str) -> Path:
     dest = DOWNLOAD_ROOT / folder
     dest.mkdir(parents=True, exist_ok=True)
     return dest
 
 
+def _file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def _safe_copy(src: Path, dest_dir: Path) -> Path:
-    """Copy src into dest_dir, appending _1, _2, ... on name collision."""
+    """Copy src into dest_dir; skip if same-content duplicate exists."""
     target = dest_dir / src.name
     if not target.exists():
         shutil.copy2(src, target)
+        return target
+    if _file_sha256(src) == _file_sha256(target):
         return target
 
     stem, suffix = src.stem, src.suffix
@@ -121,6 +108,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     chat_id = update.effective_chat.id
+    folder = chat_folders.get(chat_id, "default")
 
     if message.photo:
         tg_file = await message.photo[-1].get_file()
@@ -139,28 +127,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
-    dest_dir = _get_dest_dir(chat_id)
+    dest_dir = _get_dest_dir(folder)
     filename = Path(tg_file.file_path).name
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir) / filename
         await tg_file.download_to_drive(tmp)
         saved = _safe_copy(tmp, dest_dir)
-    folder = chat_folders.get(chat_id, "default")
-
-    if message.media_group_id:
-        group_key = f"{chat_id}:{message.media_group_id}"
-        pending_groups.setdefault(group_key, []).append(saved.name)
-        existing = group_tasks.get(group_key)
-        if existing and not existing.done():
-            existing.cancel()
-        group_tasks[group_key] = asyncio.create_task(
-            _flush_group(group_key, chat_id, message.message_id, context.bot, folder)
-        )
-    else:
-        await message.reply_text(f"Saved to {folder}/{saved.name}")
+    await message.reply_text(f"Saved to {folder}/{saved.name}")
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
