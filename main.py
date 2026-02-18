@@ -37,19 +37,28 @@ FOLDER_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff\u3400-\u4dbf-]+$")
 
 # chat_id -> current folder name
 chat_folders: dict[int, str] = {}
+# dest_dir -> {sha256_hex: Path} – lazy-built content-hash index for dedup
+_hash_index: dict[Path, dict[str, Path]] = {}
+_hash_index_total_entries = 0
+_HASH_INDEX_MAX_ENTRIES = 10_000
 # (chat_id, media_group_id) -> pending summary state
 pending_media_group_acks: dict[tuple[int, str], dict[str, object]] = {}
 
 # PTB wiki recommends timer-based media-group collection. Keep this in 1-2s range.
 MEDIA_GROUP_ACK_DELAY_SECONDS = 1.5
-DOWNLOAD_MAX_RETRIES = 3
+DOWNLOAD_MAX_RETRIES = 6
 RETRY_BACKOFF_BASE_SECONDS = 0.5
-MEDIA_GROUP_MAX_CONCURRENT_DOWNLOADS = 3
 GET_FILE_READ_TIMEOUT_SECONDS = 20.0
 # Set to None to disable read timeout for large/slow media downloads.
 DOWNLOAD_FILE_READ_TIMEOUT_SECONDS: float | None = None
 REQUEST_CONNECT_TIMEOUT_SECONDS = 10.0
 REQUEST_POOL_TIMEOUT_SECONDS = 30.0
+API_REQUEST_MIN_INTERVAL_SECONDS = 0.35
+
+# Reliability-first pipeline: serialize downloads and pace Bot API requests.
+download_pipeline_lock = asyncio.Lock()
+api_rate_lock = asyncio.Lock()
+next_api_request_at_monotonic = 0.0
 
 
 def _is_retryable_download_error(exc: Exception) -> bool:
@@ -62,6 +71,18 @@ def _retry_delay_seconds(attempt: int, exc: Exception) -> float:
     if isinstance(exc, RetryAfter):
         delay = max(delay, float(exc.retry_after))
     return delay
+
+
+async def _throttle_api_request() -> None:
+    global next_api_request_at_monotonic
+    async with api_rate_lock:
+        now = asyncio.get_running_loop().time()
+        wait_seconds = next_api_request_at_monotonic - now
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+        next_api_request_at_monotonic = (
+            asyncio.get_running_loop().time() + API_REQUEST_MIN_INTERVAL_SECONDS
+        )
 
 
 def _get_dest_dir(folder: str) -> Path:
@@ -78,13 +99,39 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _get_hash_index(dest_dir: Path) -> dict[str, Path]:
+    """Return (and lazily build) the content-hash index for *dest_dir*."""
+    global _hash_index_total_entries
+    idx = _hash_index.get(dest_dir)
+    if idx is not None:
+        return idx
+    # Evict all caches when total entries exceed the cap.
+    if _hash_index_total_entries >= _HASH_INDEX_MAX_ENTRIES:
+        _hash_index.clear()
+        _hash_index_total_entries = 0
+    idx = {}
+    for p in dest_dir.iterdir():
+        if p.is_file():
+            idx[_file_sha256(p)] = p
+    _hash_index[dest_dir] = idx
+    _hash_index_total_entries += len(idx)
+    return idx
+
+
 def _safe_copy(src: Path, dest_dir: Path) -> Path:
     """Copy src into dest_dir; skip if same-content duplicate exists."""
+    global _hash_index_total_entries
+    src_hash = _file_sha256(src)
+    idx = _get_hash_index(dest_dir)
+    existing = idx.get(src_hash)
+    if existing is not None and existing.exists():
+        return existing
+
     target = dest_dir / src.name
     if not target.exists():
         shutil.copy2(src, target)
-        return target
-    if _file_sha256(src) == _file_sha256(target):
+        idx[src_hash] = target
+        _hash_index_total_entries += 1
         return target
 
     stem, suffix = src.stem, src.suffix
@@ -93,6 +140,7 @@ def _safe_copy(src: Path, dest_dir: Path) -> Path:
         target = dest_dir / f"{stem}_{counter}{suffix}"
         if not target.exists():
             shutil.copy2(src, target)
+            idx[src_hash] = target
             return target
         counter += 1
 
@@ -137,6 +185,7 @@ async def _download_and_save_with_retry(
     last_error: Exception | None = None
     for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
         try:
+            await _throttle_api_request()
             tg_file = await bot.get_file(
                 file_id,
                 read_timeout=GET_FILE_READ_TIMEOUT_SECONDS,
@@ -146,6 +195,7 @@ async def _download_and_save_with_retry(
             filename = Path(tg_file.file_path or file_id).name
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp = Path(tmpdir) / filename
+                await _throttle_api_request()
                 await tg_file.download_to_drive(
                     tmp,
                     read_timeout=DOWNLOAD_FILE_READ_TIMEOUT_SECONDS,
@@ -188,6 +238,24 @@ async def _download_and_save_with_retry(
     return None
 
 
+async def _download_file_ids_serially(
+    bot: Bot, file_ids: list[str], dest_dir: Path
+) -> tuple[int, int]:
+    saved_count = 0
+    async with download_pipeline_lock:
+        for file_id in file_ids:
+            saved = await _download_and_save_with_retry(bot, file_id, dest_dir)
+            if saved is not None:
+                saved_count += 1
+    failed_count = len(file_ids) - saved_count
+    return saved_count, failed_count
+
+
+async def _download_one_file_serially(bot: Bot, file_id: str, dest_dir: Path) -> Path | None:
+    async with download_pipeline_lock:
+        return await _download_and_save_with_retry(bot, file_id, dest_dir)
+
+
 async def _flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) -> None:
     await asyncio.sleep(MEDIA_GROUP_ACK_DELAY_SECONDS)
 
@@ -203,15 +271,9 @@ async def _flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) ->
     try:
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
         dest_dir = _get_dest_dir(folder)
-        semaphore = asyncio.Semaphore(MEDIA_GROUP_MAX_CONCURRENT_DOWNLOADS)
-
-        async def _worker(file_id: str) -> Path | None:
-            async with semaphore:
-                return await _download_and_save_with_retry(bot, file_id, dest_dir)
-
-        results = await asyncio.gather(*(_worker(file_id) for file_id in file_ids))
-        saved_count = sum(1 for result in results if result is not None)
-        failed_count = len(file_ids) - saved_count
+        saved_count, failed_count = await _download_file_ids_serially(
+            bot, file_ids, dest_dir
+        )
 
         noun = "file" if saved_count == 1 else "files"
         if failed_count:
@@ -299,7 +361,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
         )
         dest_dir = _get_dest_dir(folder)
-        saved = await _download_and_save_with_retry(context.bot, file_id, dest_dir)
+        saved = await _download_one_file_serially(context.bot, file_id, dest_dir)
         if saved is None:
             await message.reply_text(
                 f"Failed to save after {DOWNLOAD_MAX_RETRIES} attempts"
