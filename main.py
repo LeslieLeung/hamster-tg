@@ -4,9 +4,10 @@ import re
 import shutil
 import tempfile
 import hashlib
+import asyncio
 from pathlib import Path
 
-from telegram import BotCommand, Update
+from telegram import Bot, BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -34,6 +35,10 @@ FOLDER_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff\u3400-\u4dbf-]+$")
 
 # chat_id -> current folder name
 chat_folders: dict[int, str] = {}
+# (chat_id, media_group_id) -> pending summary state
+pending_media_group_acks: dict[tuple[int, str], dict[str, object]] = {}
+
+MEDIA_GROUP_ACK_DELAY_SECONDS = 1.0
 
 def _get_dest_dir(folder: str) -> Path:
     dest = DOWNLOAD_ROOT / folder
@@ -66,6 +71,51 @@ def _safe_copy(src: Path, dest_dir: Path) -> Path:
             shutil.copy2(src, target)
             return target
         counter += 1
+
+
+def _queue_media_group_ack(
+    bot: Bot, chat_id: int, media_group_id: str, folder: str, reply_to_message_id: int
+) -> None:
+    key = (chat_id, media_group_id)
+    state = pending_media_group_acks.get(key)
+    if state is None:
+        state = {
+            "count": 0,
+            "folder": folder,
+            "reply_to_message_id": reply_to_message_id,
+            "task": None,
+        }
+        pending_media_group_acks[key] = state
+
+    state["count"] = int(state["count"]) + 1
+    state["folder"] = folder
+    task = state.get("task")
+    if isinstance(task, asyncio.Task):
+        task.cancel()
+    state["task"] = asyncio.create_task(_flush_media_group_ack(bot, chat_id, media_group_id))
+
+
+async def _flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) -> None:
+    await asyncio.sleep(MEDIA_GROUP_ACK_DELAY_SECONDS)
+
+    key = (chat_id, media_group_id)
+    state = pending_media_group_acks.pop(key, None)
+    if not state:
+        return
+
+    count = int(state["count"])
+    folder = str(state["folder"])
+    reply_to_message_id = int(state["reply_to_message_id"])
+
+    noun = "file" if count == 1 else "files"
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Saved {count} {noun} to {folder}",
+            reply_to_message_id=reply_to_message_id,
+        )
+    except Exception:
+        logger.exception("Failed to send media group summary for chat_id=%s", chat_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,7 +183,14 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         tmp = Path(tmpdir) / filename
         await tg_file.download_to_drive(tmp)
         saved = _safe_copy(tmp, dest_dir)
-    await message.reply_text(f"Saved to {folder}/{saved.name}")
+
+    if message.media_group_id:
+        # For album-style uploads, send one aggregated acknowledgement.
+        _queue_media_group_ack(
+            context.bot, chat_id, message.media_group_id, folder, message.message_id
+        )
+    else:
+        await message.reply_text(f"Saved to {folder}/{saved.name}")
 
 
 def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
