@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.mypy_cache
+
+# Virtual environments
+.venv
+
+# Environment
+.env
+
+# Runtime data
+downloads/
+telegram-bot-api/
+
+# IDE
+.claude
+.cursor

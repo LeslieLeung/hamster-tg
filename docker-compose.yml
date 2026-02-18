@@ -1,0 +1,24 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "true"
+    volumes:
+      - ./telegram-bot-api/data:/var/lib/telegram-bot-api
+    restart: unless-stopped
+
+  media-bot:
+    image: ghcr.io/leslieleung/hamster-tg:latest
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TELEGRAM_API_BASE_URL: http://telegram-bot-api:8081/bot
+      TELEGRAM_API_BASE_FILE_URL: http://telegram-bot-api:8081/file/bot
+      DOWNLOAD_ROOT: /downloads
+    volumes:
+      - ./telegram-bot-api/data:/var/lib/telegram-bot-api
+      - ./downloads:/downloads
+    depends_on:
+      - telegram-bot-api
+    restart: unless-stopped
