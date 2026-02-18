@@ -5,10 +5,12 @@ import shutil
 import tempfile
 import hashlib
 import asyncio
+import random
 from pathlib import Path
 
 from telegram import Bot, BotCommand, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -38,7 +40,29 @@ chat_folders: dict[int, str] = {}
 # (chat_id, media_group_id) -> pending summary state
 pending_media_group_acks: dict[tuple[int, str], dict[str, object]] = {}
 
-MEDIA_GROUP_ACK_DELAY_SECONDS = 1.0
+# PTB wiki recommends timer-based media-group collection. Keep this in 1-2s range.
+MEDIA_GROUP_ACK_DELAY_SECONDS = 1.5
+DOWNLOAD_MAX_RETRIES = 3
+RETRY_BACKOFF_BASE_SECONDS = 0.5
+MEDIA_GROUP_MAX_CONCURRENT_DOWNLOADS = 3
+GET_FILE_READ_TIMEOUT_SECONDS = 20.0
+# Set to None to disable read timeout for large/slow media downloads.
+DOWNLOAD_FILE_READ_TIMEOUT_SECONDS: float | None = None
+REQUEST_CONNECT_TIMEOUT_SECONDS = 10.0
+REQUEST_POOL_TIMEOUT_SECONDS = 30.0
+
+
+def _is_retryable_download_error(exc: Exception) -> bool:
+    return isinstance(exc, (TimedOut, NetworkError, RetryAfter))
+
+
+def _retry_delay_seconds(attempt: int, exc: Exception) -> float:
+    delay = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+    delay += random.uniform(0, 0.25)
+    if isinstance(exc, RetryAfter):
+        delay = max(delay, float(exc.retry_after))
+    return delay
+
 
 def _get_dest_dir(folder: str) -> Path:
     dest = DOWNLOAD_ROOT / folder
@@ -74,7 +98,12 @@ def _safe_copy(src: Path, dest_dir: Path) -> Path:
 
 
 def _queue_media_group_ack(
-    bot: Bot, chat_id: int, media_group_id: str, folder: str, reply_to_message_id: int
+    bot: Bot,
+    chat_id: int,
+    media_group_id: str,
+    folder: str,
+    reply_to_message_id: int,
+    file_id: str,
 ) -> None:
     key = (chat_id, media_group_id)
     state = pending_media_group_acks.get(key)
@@ -83,16 +112,80 @@ def _queue_media_group_ack(
             "count": 0,
             "folder": folder,
             "reply_to_message_id": reply_to_message_id,
+            "file_ids": [],
             "task": None,
         }
         pending_media_group_acks[key] = state
 
     state["count"] = int(state["count"]) + 1
     state["folder"] = folder
+    state["reply_to_message_id"] = min(
+        int(state["reply_to_message_id"]), reply_to_message_id
+    )
+    file_ids = state.get("file_ids")
+    if isinstance(file_ids, list):
+        file_ids.append(file_id)
     task = state.get("task")
     if isinstance(task, asyncio.Task):
         task.cancel()
     state["task"] = asyncio.create_task(_flush_media_group_ack(bot, chat_id, media_group_id))
+
+
+async def _download_and_save_with_retry(
+    bot: Bot, file_id: str, dest_dir: Path
+) -> Path | None:
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
+        try:
+            tg_file = await bot.get_file(
+                file_id,
+                read_timeout=GET_FILE_READ_TIMEOUT_SECONDS,
+                connect_timeout=REQUEST_CONNECT_TIMEOUT_SECONDS,
+                pool_timeout=REQUEST_POOL_TIMEOUT_SECONDS,
+            )
+            filename = Path(tg_file.file_path or file_id).name
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir) / filename
+                await tg_file.download_to_drive(
+                    tmp,
+                    read_timeout=DOWNLOAD_FILE_READ_TIMEOUT_SECONDS,
+                    connect_timeout=REQUEST_CONNECT_TIMEOUT_SECONDS,
+                    pool_timeout=REQUEST_POOL_TIMEOUT_SECONDS,
+                )
+                return _safe_copy(tmp, dest_dir)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < DOWNLOAD_MAX_RETRIES and _is_retryable_download_error(exc):
+                delay = _retry_delay_seconds(attempt, exc)
+                logger.warning(
+                    "Network error for file_id=%s (%s, attempt %s/%s), retrying in %.2fs",
+                    file_id,
+                    type(exc).__name__,
+                    attempt,
+                    DOWNLOAD_MAX_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
+
+    if last_error is not None:
+        logger.error(
+            "Download failed for file_id=%s after %s attempts: %s: %s",
+            file_id,
+            DOWNLOAD_MAX_RETRIES,
+            type(last_error).__name__,
+            last_error,
+        )
+    else:
+        logger.error(
+            "Download failed for file_id=%s after %s attempts",
+            file_id,
+            DOWNLOAD_MAX_RETRIES,
+        )
+    return None
 
 
 async def _flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) -> None:
@@ -103,15 +196,31 @@ async def _flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) ->
     if not state:
         return
 
-    count = int(state["count"])
     folder = str(state["folder"])
     reply_to_message_id = int(state["reply_to_message_id"])
+    file_ids = [str(x) for x in state.get("file_ids", [])]
 
-    noun = "file" if count == 1 else "files"
     try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        dest_dir = _get_dest_dir(folder)
+        semaphore = asyncio.Semaphore(MEDIA_GROUP_MAX_CONCURRENT_DOWNLOADS)
+
+        async def _worker(file_id: str) -> Path | None:
+            async with semaphore:
+                return await _download_and_save_with_retry(bot, file_id, dest_dir)
+
+        results = await asyncio.gather(*(_worker(file_id) for file_id in file_ids))
+        saved_count = sum(1 for result in results if result is not None)
+        failed_count = len(file_ids) - saved_count
+
+        noun = "file" if saved_count == 1 else "files"
+        if failed_count:
+            text = f"Saved {saved_count}/{len(file_ids)} files to {folder} ({failed_count} failed)"
+        else:
+            text = f"Saved {saved_count} {noun} to {folder}"
         await bot.send_message(
             chat_id=chat_id,
-            text=f"Saved {count} {noun} to {folder}",
+            text=text,
             reply_to_message_id=reply_to_message_id,
         )
     except Exception:
@@ -161,35 +270,41 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     folder = chat_folders.get(chat_id, "default")
 
     if message.photo:
-        tg_file = await message.photo[-1].get_file()
+        file_id = message.photo[-1].file_id
     elif message.video:
-        tg_file = await message.video.get_file()
+        file_id = message.video.file_id
     elif message.animation:
-        tg_file = await message.animation.get_file()
+        file_id = message.animation.file_id
     elif message.document and message.document.mime_type:
         mime = message.document.mime_type
         if mime.startswith("image/") or mime.startswith("video/"):
-            tg_file = await message.document.get_file()
+            file_id = message.document.file_id
         else:
             return
     else:
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-
-    dest_dir = _get_dest_dir(folder)
-    filename = Path(tg_file.file_path).name
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir) / filename
-        await tg_file.download_to_drive(tmp)
-        saved = _safe_copy(tmp, dest_dir)
-
     if message.media_group_id:
-        # For album-style uploads, send one aggregated acknowledgement.
+        # For album uploads, collect file_ids first and process in one batch reply.
         _queue_media_group_ack(
-            context.bot, chat_id, message.media_group_id, folder, message.message_id
+            context.bot,
+            chat_id,
+            message.media_group_id,
+            folder,
+            message.message_id,
+            file_id,
         )
     else:
+        await context.bot.send_chat_action(
+            chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+        )
+        dest_dir = _get_dest_dir(folder)
+        saved = await _download_and_save_with_retry(context.bot, file_id, dest_dir)
+        if saved is None:
+            await message.reply_text(
+                f"Failed to save after {DOWNLOAD_MAX_RETRIES} attempts"
+            )
+            return
         await message.reply_text(f"Saved to {folder}/{saved.name}")
 
 
