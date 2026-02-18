@@ -118,8 +118,19 @@ def _get_hash_index(dest_dir: Path) -> dict[str, Path]:
     return idx
 
 
+def _next_file_index(dest_dir: Path) -> int:
+    """Return the next available file_N index in dest_dir."""
+    max_idx = -1
+    for p in dest_dir.iterdir():
+        if p.is_file():
+            m = re.match(r"^file_(\d+)", p.stem)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
+
+
 def _safe_copy(src: Path, dest_dir: Path) -> Path:
-    """Copy src into dest_dir; skip if same-content duplicate exists."""
+    """Copy src into dest_dir with file_N naming; skip if same-content duplicate exists."""
     global _hash_index_total_entries
     src_hash = _file_sha256(src)
     idx = _get_hash_index(dest_dir)
@@ -127,22 +138,16 @@ def _safe_copy(src: Path, dest_dir: Path) -> Path:
     if existing is not None and existing.exists():
         return existing
 
-    target = dest_dir / src.name
-    if not target.exists():
-        shutil.copy2(src, target)
-        idx[src_hash] = target
-        _hash_index_total_entries += 1
-        return target
-
-    stem, suffix = src.stem, src.suffix
-    counter = 1
-    while True:
-        target = dest_dir / f"{stem}_{counter}{suffix}"
-        if not target.exists():
-            shutil.copy2(src, target)
-            idx[src_hash] = target
-            return target
-        counter += 1
+    suffix = src.suffix
+    n = _next_file_index(dest_dir)
+    target = dest_dir / f"file_{n}{suffix}"
+    while target.exists():
+        n += 1
+        target = dest_dir / f"file_{n}{suffix}"
+    shutil.copy2(src, target)
+    idx[src_hash] = target
+    _hash_index_total_entries += 1
+    return target
 
 
 def _queue_media_group_ack(
