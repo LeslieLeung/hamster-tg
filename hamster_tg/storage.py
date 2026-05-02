@@ -13,6 +13,16 @@ def get_dest_dir(folder: str) -> Path:
     return dest
 
 
+def recent_folder_names(limit: int = 10) -> list[str]:
+    """Return folder names under DOWNLOAD_ROOT ordered by newest modification time."""
+    if not DOWNLOAD_ROOT.exists():
+        return []
+
+    folders = [p for p in DOWNLOAD_ROOT.iterdir() if p.is_dir()]
+    folders.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p.name for p in folders[:limit]]
+
+
 def file_sha256(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as f:
@@ -68,4 +78,3 @@ def safe_copy(src: Path, dest_dir: Path) -> Path:
     idx[src_hash] = target
     state.hash_index_total_entries += 1
     return target
-

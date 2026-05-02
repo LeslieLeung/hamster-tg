@@ -9,7 +9,16 @@ from telegram.ext import (
 )
 
 from .config import BASE_FILE_URL, BASE_URL, BOT_TOKEN
-from .handlers import error_handler, handle_media, new, newfolder, post_init, start, status
+from .handlers import (
+    error_handler,
+    handle_media,
+    list_folders,
+    new,
+    newfolder,
+    post_init,
+    start,
+    status,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,7 @@ def create_application():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("newfolder", newfolder))
+    app.add_handler(CommandHandler("list", list_folders))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(
         MessageHandler(
@@ -50,4 +60,3 @@ def main() -> None:
     app = create_application()
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-

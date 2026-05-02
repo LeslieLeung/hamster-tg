@@ -8,7 +8,7 @@ from . import state
 from .config import DOWNLOAD_MAX_RETRIES, FOLDER_NAME_RE
 from .downloader import download_one_file_serially
 from .media_group import queue_media_group_ack
-from .storage import get_dest_dir
+from .storage import get_dest_dir, recent_folder_names
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "/new <name> — create & switch to a folder\n"
         "/newfolder <name> — create & switch to a folder\n"
+        "/list — show 10 recent folders\n"
         "/status — show current folder and file count"
     )
 
@@ -56,6 +57,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dest = get_dest_dir(folder)
     count = sum(1 for f in dest.iterdir() if f.is_file())
     await update.message.reply_text(f"Current folder: {folder}\nFiles: {count}")
+
+
+async def list_folders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    folders = recent_folder_names()
+    if not folders:
+        await update.message.reply_text("No folders found.")
+        return
+
+    lines = [f"{i}. {name}" for i, name in enumerate(folders, start=1)]
+    await update.message.reply_text("Recent folders:\n" + "\n".join(lines))
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -111,7 +122,7 @@ async def post_init(application: Application) -> None:
         [
             BotCommand("new", "Create & switch to a folder"),
             BotCommand("newfolder", "Create & switch to a folder"),
+            BotCommand("list", "Show 10 recent folders"),
             BotCommand("status", "Show current folder and file count"),
         ]
     )
-
