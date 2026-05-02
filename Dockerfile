@@ -3,5 +3,5 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 COPY pyproject.toml .
 RUN uv sync --no-dev --no-install-project
-COPY main.py .
-CMD ["uv", "run", "main.py"]
+COPY hamster_tg ./hamster_tg
+CMD ["uv", "run", "python", "-m", "hamster_tg"]

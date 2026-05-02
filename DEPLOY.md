@@ -37,6 +37,12 @@ TELEGRAM_API_HASH=你的API Hash
 
 ## 3. 启动服务
 
+本地直接运行：
+
+```bash
+uv run python -m hamster_tg
+```
+
 生产环境（拉取预构建镜像）：
 
 ```bash
