@@ -298,14 +298,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Welcome! Send me photos, videos, GIFs, or files and I'll save them.\n\n"
         "Commands:\n"
+        "/new <name> — create & switch to a folder\n"
         "/newfolder <name> — create & switch to a folder\n"
         "/status — show current folder and file count"
     )
 
 
-async def newfolder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _switch_folder(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /newfolder <name>")
+        await update.message.reply_text(f"Usage: /{command} <name>")
         return
 
     name = context.args[0]
@@ -319,6 +320,14 @@ async def newfolder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     chat_folders[update.effective_chat.id] = name
     await update.message.reply_text(f"Switched to folder: {name}")
+
+
+async def new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _switch_folder(update, context, "new")
+
+
+async def newfolder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _switch_folder(update, context, "newfolder")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -381,6 +390,7 @@ def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
+        BotCommand("new", "Create & switch to a folder"),
         BotCommand("newfolder", "Create & switch to a folder"),
         BotCommand("status", "Show current folder and file count"),
     ])
@@ -399,6 +409,7 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("newfolder", newfolder))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(

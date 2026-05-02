@@ -20,3 +20,5 @@ telegram-bot-api/
 # IDE
 .claude
 .cursor
+
+.DS_Store
