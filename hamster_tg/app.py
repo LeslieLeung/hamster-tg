@@ -3,6 +3,7 @@ import logging
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -19,6 +20,7 @@ from .handlers import (
     start,
     status,
 )
+from .retry import handle_retry
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ def create_application():
     )
 
     app.add_error_handler(error_handler)
+    app.add_handler(CallbackQueryHandler(handle_retry, pattern=r"^retry:", block=False))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("newfolder", newfolder))

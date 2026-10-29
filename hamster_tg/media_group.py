@@ -2,13 +2,10 @@ import asyncio
 import logging
 
 from telegram import Bot
-from telegram.constants import ChatAction
 
 from . import state
 from .config import MEDIA_GROUP_ACK_DELAY_SECONDS
-from .downloader import download_file_ids_serially
-from .storage import get_dest_dir
-
+from .retry import save_and_report
 
 logger = logging.getLogger(__name__)
 
@@ -62,25 +59,6 @@ async def flush_media_group_ack(bot: Bot, chat_id: int, media_group_id: str) -> 
     file_ids = [str(x) for x in pending_state.get("file_ids", [])]
 
     try:
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        dest_dir = get_dest_dir(folder)
-        saved_count, failed_count = await download_file_ids_serially(
-            bot, file_ids, dest_dir
-        )
-
-        noun = "file" if saved_count == 1 else "files"
-        if failed_count:
-            text = (
-                f"Saved {saved_count}/{len(file_ids)} files to {folder} "
-                f"({failed_count} failed)"
-            )
-        else:
-            text = f"Saved {saved_count} {noun} to {folder}"
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_to_message_id=reply_to_message_id,
-        )
+        await save_and_report(bot, chat_id, file_ids, folder, reply_to_message_id)
     except Exception:
         logger.exception("Failed to send media group summary for chat_id=%s", chat_id)
-
