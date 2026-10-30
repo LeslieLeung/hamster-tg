@@ -4,7 +4,7 @@ from time import monotonic
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 from . import state
@@ -151,7 +151,12 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = result_text(results, request.folder)
         try:
             await query.edit_message_text(text=text, reply_markup=markup)
-        except TelegramError:
+        except TelegramError as exc:
+            if (
+                isinstance(exc, BadRequest)
+                and "message is not modified" in str(exc).lower()
+            ):
+                return
             # A deleted or uneditable summary must not hide the retry result.
             logger.warning("Failed to edit retry summary", exc_info=True)
             await context.bot.send_message(

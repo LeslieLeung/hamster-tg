@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from telegram.error import BadRequest
 
 from hamster_tg import downloader, handlers, media_group, retry, state
@@ -152,7 +153,12 @@ def test_expired_and_cross_chat_buttons_do_not_download(monkeypatch):
     save.assert_not_awaited()
 
 
-def test_retry_result_is_sent_if_original_message_cannot_be_edited(monkeypatch):
+@pytest.mark.parametrize(
+    "error_message", ["message to edit not found", "message can't be edited"]
+)
+def test_retry_result_is_sent_if_original_message_cannot_be_edited(
+    monkeypatch, error_message
+):
     token = retry.register_retry(state.RetryRequest(7, "folder", ["a"], 42))
     monkeypatch.setattr(
         retry,
@@ -164,7 +170,7 @@ def test_retry_result_is_sent_if_original_message_cannot_be_edited(monkeypatch):
         ),
     )
     query = make_query(token)
-    query.edit_message_text.side_effect = BadRequest("message to edit not found")
+    query.edit_message_text.side_effect = BadRequest(error_message)
     bot = make_bot()
 
     asyncio.run(
@@ -174,6 +180,58 @@ def test_retry_result_is_sent_if_original_message_cannot_be_edited(monkeypatch):
     )
 
     assert bot.send_message.call_args.kwargs["text"] == "Saved to folder/file_0.jpg"
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Message is not modified",
+        "Bad Request: message is not modified: specified new message content and "
+        "reply markup are exactly the same as a current content and reply markup "
+        "of the message",
+    ],
+)
+def test_unchanged_retry_summary_does_not_send_duplicates(monkeypatch, error_message):
+    token = retry.register_retry(state.RetryRequest(7, "folder", ["a"], 42))
+    failure = DownloadResult("a", 1, error=PermissionError("disk denied"))
+    save = AsyncMock(
+        side_effect=[
+            [failure],
+            [failure],
+            [DownloadResult("a", 1, path=Path("file_0.jpg"))],
+        ]
+    )
+    monkeypatch.setattr(retry, "save_files", save)
+    query = make_query(token)
+    query.edit_message_text.side_effect = [
+        BadRequest(error_message),
+        BadRequest(error_message),
+        None,
+    ]
+    bot = make_bot()
+
+    async def scenario():
+        for _ in range(2):
+            await retry.handle_retry(
+                SimpleNamespace(callback_query=query), SimpleNamespace(bot=bot)
+            )
+            request = state.retry_requests[token]
+            assert request.file_ids == ["a"]
+            assert not request.in_progress
+            sent = query.edit_message_text.call_args.kwargs
+            assert "PermissionError: disk denied" in sent["text"]
+            assert sent["reply_markup"] == retry.retry_markup(token)
+            bot.send_message.assert_not_awaited()
+        await retry.handle_retry(
+            SimpleNamespace(callback_query=query), SimpleNamespace(bot=bot)
+        )
+
+    asyncio.run(scenario())
+
+    assert save.await_count == 3
+    assert token not in state.retry_requests
+    assert query.edit_message_text.call_args.kwargs["reply_markup"] is None
+    bot.send_message.assert_not_awaited()
 
 
 def test_upload_action_failure_does_not_prevent_saving(monkeypatch):
