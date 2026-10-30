@@ -1,13 +1,12 @@
 import logging
 
 from telegram import BotCommand, Update
-from telegram.constants import ChatAction
 from telegram.ext import Application, ContextTypes
 
 from . import state
-from .config import DOWNLOAD_MAX_RETRIES, FOLDER_NAME_RE
-from .downloader import download_one_file_serially
+from .config import FOLDER_NAME_RE
 from .media_group import queue_media_group_ack
+from .retry import save_and_report
 from .storage import get_dest_dir, recent_folder_names
 
 
@@ -100,17 +99,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             file_id,
         )
     else:
-        await context.bot.send_chat_action(
-            chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
-        )
-        dest_dir = get_dest_dir(folder)
-        saved = await download_one_file_serially(context.bot, file_id, dest_dir)
-        if saved is None:
-            await message.reply_text(
-                f"Failed to save after {DOWNLOAD_MAX_RETRIES} attempts"
-            )
-            return
-        await message.reply_text(f"Saved to {folder}/{saved.name}")
+        await save_and_report(context.bot, chat_id, [file_id], folder, message.message_id)
 
 
 def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

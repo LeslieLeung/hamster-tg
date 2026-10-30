@@ -1,10 +1,11 @@
 import hashlib
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
-from .config import DOWNLOAD_ROOT
 from . import state
+from .config import DOWNLOAD_ROOT
 
 
 def get_dest_dir(folder: str) -> Path:
@@ -74,7 +75,10 @@ def safe_copy(src: Path, dest_dir: Path) -> Path:
     while target.exists():
         n += 1
         target = dest_dir / f"file_{n}{suffix}"
-    shutil.copy2(src, target)
+    with tempfile.TemporaryDirectory(dir=dest_dir, prefix=".saving-") as tmpdir:
+        temporary_path = Path(tmpdir) / target.name
+        shutil.copy2(src, temporary_path)
+        temporary_path.replace(target)
     idx[src_hash] = target
     state.hash_index_total_entries += 1
     return target

@@ -1,5 +1,17 @@
 import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
+
+
+@dataclass
+class RetryRequest:
+    chat_id: int
+    folder: str
+    file_ids: list[str]
+    reply_to_message_id: int
+    created_at: float = field(default_factory=monotonic)
+    in_progress: bool = False
 
 
 # chat_id -> current folder name
@@ -18,3 +30,4 @@ download_pipeline_lock = asyncio.Lock()
 api_rate_lock = asyncio.Lock()
 next_api_request_at_monotonic = 0.0
 
+retry_requests: dict[str, RetryRequest] = {}

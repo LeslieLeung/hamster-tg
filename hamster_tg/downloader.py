@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram import Bot
@@ -19,8 +20,15 @@ from .config import (
 )
 from .storage import safe_copy
 
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DownloadResult:
+    file_id: str
+    attempts: int
+    path: Path | None = None
+    error: Exception | None = None
 
 
 def is_retryable_download_error(exc: Exception) -> bool:
@@ -48,10 +56,11 @@ async def throttle_api_request() -> None:
 
 async def download_and_save_with_retry(
     bot: Bot, file_id: str, dest_dir: Path
-) -> Path | None:
+) -> DownloadResult:
     last_error: Exception | None = None
     for attempt in range(1, DOWNLOAD_MAX_RETRIES + 1):
         try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
             await throttle_api_request()
             tg_file = await bot.get_file(
                 file_id,
@@ -69,7 +78,7 @@ async def download_and_save_with_retry(
                     connect_timeout=REQUEST_CONNECT_TIMEOUT_SECONDS,
                     pool_timeout=REQUEST_POOL_TIMEOUT_SECONDS,
                 )
-                return safe_copy(tmp, dest_dir)
+                return DownloadResult(file_id, attempt, path=safe_copy(tmp, dest_dir))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -92,7 +101,7 @@ async def download_and_save_with_retry(
         logger.error(
             "Download failed for file_id=%s after %s attempts: %s: %s",
             file_id,
-            DOWNLOAD_MAX_RETRIES,
+            attempt,
             type(last_error).__name__,
             last_error,
         )
@@ -100,27 +109,23 @@ async def download_and_save_with_retry(
         logger.error(
             "Download failed for file_id=%s after %s attempts",
             file_id,
-            DOWNLOAD_MAX_RETRIES,
+            attempt,
         )
-    return None
+    return DownloadResult(file_id, attempt, error=last_error)
 
 
 async def download_file_ids_serially(
     bot: Bot, file_ids: list[str], dest_dir: Path
-) -> tuple[int, int]:
-    saved_count = 0
+) -> list[DownloadResult]:
+    results = []
     async with state.download_pipeline_lock:
         for file_id in file_ids:
-            saved = await download_and_save_with_retry(bot, file_id, dest_dir)
-            if saved is not None:
-                saved_count += 1
-    failed_count = len(file_ids) - saved_count
-    return saved_count, failed_count
+            results.append(await download_and_save_with_retry(bot, file_id, dest_dir))
+    return results
 
 
 async def download_one_file_serially(
     bot: Bot, file_id: str, dest_dir: Path
-) -> Path | None:
+) -> DownloadResult:
     async with state.download_pipeline_lock:
         return await download_and_save_with_retry(bot, file_id, dest_dir)
-
