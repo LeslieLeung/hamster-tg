@@ -16,6 +16,7 @@ services:
       TELEGRAM_API_BASE_URL: http://telegram-bot-api:8081/bot
       TELEGRAM_API_BASE_FILE_URL: http://telegram-bot-api:8081/file/bot
       DOWNLOAD_ROOT: /downloads
+      DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-2}
       RETRY_REQUEST_TTL_SECONDS: ${RETRY_REQUEST_TTL_SECONDS:-86400}
       RETRY_REQUEST_MAX_ENTRIES: ${RETRY_REQUEST_MAX_ENTRIES:-1000}
     volumes:

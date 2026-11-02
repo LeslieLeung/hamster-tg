@@ -17,11 +17,12 @@ from .handlers import (
     new,
     newfolder,
     post_init,
+    post_stop,
+    scan,
     start,
     status,
 )
 from .retry import handle_retry
-
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ def create_application():
         .base_file_url(BASE_FILE_URL)
         .local_mode(True)
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 
@@ -44,6 +46,7 @@ def create_application():
     app.add_handler(CommandHandler("newfolder", newfolder))
     app.add_handler(CommandHandler("list", list_folders))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("scan", scan))
     app.add_handler(
         MessageHandler(
             (

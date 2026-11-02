@@ -1,117 +1,137 @@
 import logging
 
-from telegram import BotCommand, Update
-from telegram.ext import Application, ContextTypes
+from telegram import BotCommand
 
-from . import state
-from .config import FOLDER_NAME_RE
-from .media_group import queue_media_group_ack
-from .retry import save_and_report
-from .storage import get_dest_dir, recent_folder_names
-
+from .config import DOWNLOAD_ROOT, FOLDER_NAME_RE
+from .service import SaveService
+from .threads import blocking
 
 logger = logging.getLogger(__name__)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def get_service(context):
+    return context.application.bot_data["service"]
+
+
+async def start(update, context):
     await update.message.reply_text(
-        "Welcome! Send me photos, videos, GIFs, or files and I'll save them.\n\n"
-        "Commands:\n"
-        "/new <name> — create & switch to a folder\n"
-        "/newfolder <name> — create & switch to a folder\n"
-        "/list — show 10 recent folders\n"
-        "/status — show current folder and file count"
+        "发送图片、视频或 GIF，机器人会将它们加入保存队列。\n\n"
+        "/new <名称> — 创建并切换目录\n"
+        "/list — 最近目录\n/status — 当前目录和队列\n"
+        "/scan [目录名] — 扫描文件并更新索引；运行中再次发送可查询进度"
     )
 
 
-async def switch_folder(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, command: str
-) -> None:
-    if not context.args:
+async def switch_folder(update, context, command):
+    if len(context.args) != 1:
         await update.message.reply_text(f"Usage: /{command} <name>")
         return
-
     name = context.args[0]
-    if not FOLDER_NAME_RE.match(name):
-        await update.message.reply_text(
-            "Invalid folder name. Only letters, digits, Chinese characters, '-' and '_' are allowed."
-        )
+    if not FOLDER_NAME_RE.fullmatch(name):
+        await update.message.reply_text("目录名称仅支持字母、数字、中文、'-' 和 '_'。")
         return
-
-    get_dest_dir(name)
-    state.chat_folders[update.effective_chat.id] = name
+    try:
+        await get_service(context).switch_folder(update.effective_chat.id, name)
+    except (OSError, ValueError) as exc:
+        await update.message.reply_text(f"切换目录失败：{exc}")
+        return
     await update.message.reply_text(f"Switched to folder: {name}")
 
 
-async def new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def new(update, context):
     await switch_folder(update, context, "new")
 
 
-async def newfolder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def newfolder(update, context):
     await switch_folder(update, context, "newfolder")
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    folder = state.chat_folders.get(update.effective_chat.id, "default")
-    dest = get_dest_dir(folder)
-    count = sum(1 for f in dest.iterdir() if f.is_file())
-    await update.message.reply_text(f"Current folder: {folder}\nFiles: {count}")
+async def status(update, context):
+    service = get_service(context)
+    folder = await blocking(service.db.current_folder, update.effective_chat.id)
+    count, pending = await blocking(service.db.status, folder)
+    info = await blocking(service.db.folder, folder)
+    text = f"当前目录：{folder}\n文件：{count}\n等待/处理中：{pending}\n保存并发：{service.concurrency}"
+    if info and not info["indexed"]:
+        text += f"\n目录索引：{info['scan_state']}；未完成前任务将等待，可用 /scan {folder} 重试。"
+    if service.scanner.running:
+        text += "\n" + service.scanner.progress.text()
+    await update.message.reply_text(text)
 
 
-async def list_folders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    folders = recent_folder_names()
-    if not folders:
-        await update.message.reply_text("No folders found.")
+async def list_folders(update, context):
+    folders = await blocking(get_service(context).db.recent_folders)
+    text = (
+        "Recent folders:\n"
+        + "\n".join(f"{i}. {name}" for i, name in enumerate(folders, 1))
+        if folders
+        else "No folders found."
+    )
+    await update.message.reply_text(text)
+
+
+async def scan(update, context):
+    scanner = get_service(context).scanner
+    if scanner.running:
+        await update.message.reply_text(scanner.progress.text())
         return
+    if len(context.args) > 1 or (
+        context.args and not FOLDER_NAME_RE.fullmatch(context.args[0])
+    ):
+        await update.message.reply_text("Usage: /scan [目录名]")
+        return
+    folder = context.args[0] if context.args else None
+    scanner.start(folder, update.effective_chat.id)
+    await update.message.reply_text(
+        "扫描已启动，完成后会发送汇总。再次发送 /scan 可查询进度。"
+    )
 
-    lines = [f"{i}. {name}" for i, name in enumerate(folders, start=1)]
-    await update.message.reply_text("Recent folders:\n" + "\n".join(lines))
 
-
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_media(update, context):
     message = update.message
-    chat_id = update.effective_chat.id
-    folder = state.chat_folders.get(chat_id, "default")
-
     if message.photo:
-        file_id = message.photo[-1].file_id
+        media = message.photo[-1]
     elif message.video:
-        file_id = message.video.file_id
+        media = message.video
     elif message.animation:
-        file_id = message.animation.file_id
-    elif message.document and message.document.mime_type:
-        mime = message.document.mime_type
-        if mime.startswith("image/") or mime.startswith("video/"):
-            file_id = message.document.file_id
-        else:
-            return
+        media = message.animation
+    elif (
+        message.document
+        and message.document.mime_type
+        and message.document.mime_type.startswith(("image/", "video/"))
+    ):
+        media = message.document
     else:
         return
-
-    if message.media_group_id:
-        # For album uploads, collect file_ids first and process in one batch reply.
-        queue_media_group_ack(
-            context.bot,
-            chat_id,
-            message.media_group_id,
-            folder,
-            message.message_id,
-            file_id,
-        )
-    else:
-        await save_and_report(context.bot, chat_id, [file_id], folder, message.message_id)
+    await get_service(context).enqueue(
+        update.effective_chat.id,
+        message.message_id,
+        media.file_id,
+        getattr(media, "file_unique_id", None),
+        message.media_group_id,
+    )
 
 
-def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(update, context):
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
-async def post_init(application: Application) -> None:
+async def post_init(application):
     await application.bot.set_my_commands(
         [
             BotCommand("new", "Create & switch to a folder"),
             BotCommand("newfolder", "Create & switch to a folder"),
             BotCommand("list", "Show 10 recent folders"),
-            BotCommand("status", "Show current folder and file count"),
+            BotCommand("status", "Show current folder and pending files"),
+            BotCommand("scan", "Scan saved files; repeat to check progress"),
         ]
     )
+    service = SaveService(DOWNLOAD_ROOT, application.bot)
+    application.bot_data["service"] = service
+    await service.start()
+
+
+async def post_stop(application):
+    service = application.bot_data.get("service")
+    if service:
+        await service.close()
