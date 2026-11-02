@@ -1,2 +1,1 @@
 """Hamster TG bot package."""
-

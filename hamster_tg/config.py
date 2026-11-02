@@ -3,7 +3,6 @@ import os
 import re
 from pathlib import Path
 
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -15,6 +14,9 @@ BASE_FILE_URL = os.environ.get(
     "TELEGRAM_API_BASE_FILE_URL", "http://telegram-bot-api:8081/file/bot"
 )
 DOWNLOAD_ROOT = Path(os.environ.get("DOWNLOAD_ROOT", "/downloads"))
+DOWNLOAD_CONCURRENCY = int(os.environ.get("DOWNLOAD_CONCURRENCY", "2"))
+if DOWNLOAD_CONCURRENCY < 1:
+    raise ValueError("DOWNLOAD_CONCURRENCY must be a positive integer")
 
 FOLDER_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff\u3400-\u4dbf-]+$")
 
@@ -30,3 +32,5 @@ REQUEST_POOL_TIMEOUT_SECONDS = 30.0
 API_REQUEST_MIN_INTERVAL_SECONDS = 0.35
 RETRY_REQUEST_TTL_SECONDS = int(os.environ.get("RETRY_REQUEST_TTL_SECONDS", "86400"))
 RETRY_REQUEST_MAX_ENTRIES = int(os.environ.get("RETRY_REQUEST_MAX_ENTRIES", "1000"))
+if RETRY_REQUEST_TTL_SECONDS < 1 or RETRY_REQUEST_MAX_ENTRIES < 1:
+    raise ValueError("Retry lifetime and maximum entries must be positive")
